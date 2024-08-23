@@ -14,7 +14,7 @@ edition = "2021"
 readme = "README.md"
 
 [dependencies.futures]
-version = "0.3.0"
+version = "0.3.30"
 default-features = false
 features = ["std"]
 

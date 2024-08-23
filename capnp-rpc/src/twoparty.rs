@@ -25,7 +25,7 @@
 use capnp::capability::Promise;
 use capnp::message::ReaderOptions;
 use futures::channel::oneshot;
-use futures::{AsyncRead, AsyncWrite, FutureExt, TryFutureExt};
+use futures::{pin_mut, AsyncRead, AsyncWrite, FutureExt, TryFutureExt};
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -163,30 +163,24 @@ where
     fn receive_incoming_message(
         &mut self,
     ) -> Promise<Option<Box<dyn crate::IncomingMessage + 'static>>, ::capnp::Error> {
-        let inner = self.inner.borrow_mut();
-
-        let maybe_input_stream = inner.input_stream.borrow_mut().take();
-        let return_it_here = inner.input_stream.clone();
-        match maybe_input_stream {
-            Some(mut s) => {
-                let receive_options = inner.receive_options;
-                Promise::from_future(async move {
-                    let maybe_message =
-                        ::capnp_futures::serialize::try_read_message(&mut s, receive_options)
-                            .await?;
-                    *return_it_here.borrow_mut() = Some(s);
-                    Ok(maybe_message.map(|message| {
-                        Box::new(IncomingMessage::new(message)) as Box<dyn crate::IncomingMessage>
-                    }))
-                })
-            }
-            None => {
-                Promise::err(::capnp::Error::failed(
+        // hope keeping this reference count bumped up until promise returns is ok
+        let retained_inner = self.inner.clone();
+        Promise::from_future(async move {
+            let inner = retained_inner.borrow_mut();
+            let mut borrowed_stream = inner.input_stream.borrow_mut();
+            let Some(readable_input_stream) = borrowed_stream.as_mut() else {
+                return Err(::capnp::Error::failed(
                     "this should not be possible".to_string(),
-                ))
-                //   unreachable!(),
-            }
-        }
+                ));
+            };
+            pin_mut!(readable_input_stream);
+            Ok(::capnp_futures::serialize::try_read_message(
+                readable_input_stream,
+                inner.receive_options.clone(),
+            )
+            .await?
+            .map(|message| Box::new(IncomingMessage::new(message)) as _))
+        })
     }
 
     fn shutdown(&mut self, result: ::capnp::Result<()>) -> Promise<(), ::capnp::Error> {

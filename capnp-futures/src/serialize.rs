@@ -21,18 +21,18 @@
 //! Asynchronous reading and writing of messages using the
 //! [standard stream framing](https://capnproto.org/encoding.html#serialization-over-a-stream).
 
+use std::pin::Pin;
+
 use capnp::serialize::{OwnedSegments, SegmentLengthsBuilder};
 use capnp::{message, Error, OutputSegments, Result};
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Asynchronously reads a message from `reader`.
-pub async fn read_message<R>(
-    reader: R,
+pub async fn read_message<R: AsyncRead>(
+    reader: Pin<&mut R>,
     options: message::ReaderOptions,
 ) -> Result<message::Reader<OwnedSegments>>
-where
-    R: AsyncRead + Unpin,
 {
     match try_read_message(reader, options).await? {
         Some(s) => Ok(s),
@@ -45,32 +45,28 @@ where
 /// containing an unknown number of messages, you could call this function
 /// repeatedly until it returns `None`.
 pub async fn try_read_message<R>(
-    mut reader: R,
+    mut reader: Pin<&mut R>,
     options: message::ReaderOptions,
 ) -> Result<Option<message::Reader<OwnedSegments>>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead,
 {
-    let Some(segment_lengths_builder) = read_segment_table(&mut reader, options).await? else {
+    let Some(segment_lengths_builder) = read_segment_table(reader.as_mut(), options).await? else {
         return Ok(None);
     };
-    Ok(Some(
-        read_segments(
-            reader,
-            segment_lengths_builder.into_owned_segments(),
-            options,
-        )
-        .await?,
-    ))
+    let mut owned_segments = segment_lengths_builder.into_owned_segments();
+    reader.read_exact(&mut owned_segments[..]).await?;
+    Ok(Some(message::Reader::new(owned_segments, options.clone())))
 }
 
 async fn read_segment_table<R>(
-    mut reader: R,
+    mut reader: Pin<&mut R>,
     options: message::ReaderOptions,
 ) -> Result<Option<SegmentLengthsBuilder>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead,
 {
+    let mut reader = reader.as_mut();
     let mut buf: [u8; 8] = [0; 8];
     {
         let n = reader.read(&mut buf[..]).await?;
@@ -119,19 +115,6 @@ where
     }
 
     Ok(Some(segment_lengths_builder))
-}
-
-/// Reads segments from `read`.
-async fn read_segments<R>(
-    mut read: R,
-    mut owned_segments: OwnedSegments,
-    options: message::ReaderOptions,
-) -> Result<message::Reader<OwnedSegments>>
-where
-    R: AsyncRead + Unpin,
-{
-    read.read_exact(&mut owned_segments[..]).await?;
-    Ok(message::Reader::new(owned_segments, options))
 }
 
 /// Parses the first word of the segment table.
@@ -263,7 +246,7 @@ pub mod test {
     use std::task::{Context, Poll};
 
     use futures::io::Cursor;
-    use futures::{AsyncRead, AsyncWrite};
+    use futures::{pin_mut, AsyncRead, AsyncWrite};
 
     use quickcheck::{quickcheck, TestResult};
 
@@ -283,9 +266,11 @@ pub mod test {
                 0, 0, 0, 0,
             ], // 0 length
         );
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         let segment_lengths = exec
             .run_until(read_segment_table(
-                Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new(),
             ))
             .unwrap()
@@ -300,10 +285,11 @@ pub mod test {
                 1, 0, 0, 0,
             ], // 1 length
         );
-
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         let segment_lengths = exec
             .run_until(read_segment_table(
-                &mut Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new(),
             ))
             .unwrap()
@@ -320,9 +306,11 @@ pub mod test {
                 0, 0, 0, 0,
             ], // padding
         );
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         let segment_lengths = exec
             .run_until(read_segment_table(
-                &mut Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new(),
             ))
             .unwrap()
@@ -339,9 +327,11 @@ pub mod test {
                 0, 1, 0, 0,
             ], // 256 length
         );
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         let segment_lengths = exec
             .run_until(read_segment_table(
-                &mut Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new(),
             ))
             .unwrap()
@@ -363,9 +353,11 @@ pub mod test {
                 0, 0, 0, 0,
             ], // padding
         );
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         let segment_lengths = exec
             .run_until(read_segment_table(
-                &mut Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new(),
             ))
             .unwrap()
@@ -385,18 +377,22 @@ pub mod test {
 
         buf.extend([0, 2, 0, 0]); // 513 segments
         buf.extend([0; 513 * 4]);
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         assert!(exec
             .run_until(read_segment_table(
-                Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new()
             ))
             .is_err());
         buf.clear();
 
         buf.extend([0, 0, 0, 0]); // 1 segments
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         assert!(exec
             .run_until(read_segment_table(
-                Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new()
             ))
             .is_err());
@@ -405,18 +401,22 @@ pub mod test {
 
         buf.extend([0, 0, 0, 0]); // 1 segments
         buf.extend([0; 3]);
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         assert!(exec
             .run_until(read_segment_table(
-                Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new()
             ))
             .is_err());
         buf.clear();
 
         buf.extend([255, 255, 255, 255]); // 0 segments
+        let cursor = Cursor::new(&buf[..]);
+        pin_mut!(cursor);
         assert!(exec
             .run_until(read_segment_table(
-                Cursor::new(&buf[..]),
+                cursor.as_mut(),
                 message::ReaderOptions::new()
             ))
             .is_err());
@@ -651,7 +651,7 @@ pub mod test {
             if segments.is_empty() || read_blocking_period == 0 || write_blocking_period == 0 {
                 return TestResult::discard();
             }
-            let (mut read, segments) = {
+            let (read, segments) = {
                 let cursor = std::io::Cursor::new(Vec::new());
                 let mut writer = BlockingWrite::new(cursor, write_blocking_period);
                 futures::executor::block_on(Box::pin(write_message(&mut writer, &segments)))
@@ -661,11 +661,11 @@ pub mod test {
                 cursor.set_position(0);
                 (BlockingRead::new(cursor, read_blocking_period), segments)
             };
-
-            let message = futures::executor::block_on(Box::pin(try_read_message(
-                &mut read,
+            pin_mut!(read);
+            let message = futures::executor::block_on(try_read_message(
+                read,
                 Default::default(),
-            )))
+            ))
             .expect("reading")
             .unwrap();
             let message_segments = message.into_segments();

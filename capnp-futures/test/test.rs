@@ -28,7 +28,7 @@ mod tests {
     use crate::addressbook_capnp::{address_book, person};
     use capnp::message;
     use capnp_futures::serialize;
-    use futures::task::LocalSpawnExt;
+    use futures::{pin_mut, task::LocalSpawnExt};
 
     fn populate_address_book(address_book: address_book::Builder) {
         let mut people = address_book.init_people(2);
@@ -137,6 +137,7 @@ mod tests {
         let f0 = serialize::write_message(stream0, message)
             .map_err(|e| panic!("write error {:?}", e))
             .map(|_| ());
+        pin_mut!(stream1);
         let f1 = serialize::try_read_message(stream1, capnp::message::ReaderOptions::new())
             .and_then(|maybe_message_reader| match maybe_message_reader {
                 None => panic!("did not get message"),
@@ -167,8 +168,9 @@ mod tests {
     #[test]
     #[allow(clippy::let_underscore_future)]
     fn static_lifetime_not_required_funcs() {
-        let (mut write, mut read) = async_byte_channel::channel();
-        let _ = serialize::try_read_message(&mut read, message::ReaderOptions::default());
+        let (mut write, read) = async_byte_channel::channel();
+        pin_mut!(read);
+        let _ = serialize::try_read_message(read, message::ReaderOptions::default());
         let _ = serialize::write_message(&mut write, message::Builder::new_default());
     }
 

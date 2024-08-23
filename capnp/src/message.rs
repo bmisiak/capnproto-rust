@@ -223,7 +223,7 @@ where
 {
     pub fn new(segments: S, options: ReaderOptions) -> Self {
         Self {
-            arena: ReaderArenaImpl::new(segments, options),
+            arena: ReaderArenaImpl::new(segments, options.clone()),
         }
     }
 

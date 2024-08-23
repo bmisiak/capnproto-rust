@@ -27,7 +27,8 @@ use std::task::{Context, Poll};
 
 use capnp::serialize::OwnedSegments;
 use capnp::{message, Result};
-use futures::{AsyncRead, AsyncWrite};
+use futures::{pin_mut, AsyncRead, AsyncWrite};
+use pin_project_lite::pin_project;
 
 use crate::serialize::AsOutputSegments;
 
@@ -38,30 +39,27 @@ enum PackedReadStage {
     DrainingBuffer,
     WritingPassthrough,
 }
+pin_project! {
+    /// An `AsyncRead` wrapper that unpacks packed data.
+    pub struct PackedRead<R: AsyncRead>
+    {
+        #[pin]
+        inner: R,
+        stage: PackedReadStage,
 
-/// An `AsyncRead` wrapper that unpacks packed data.
-pub struct PackedRead<R>
-where
-    R: AsyncRead + Unpin,
-{
-    inner: R,
-    stage: PackedReadStage,
+        // 10 = tag byte, up to 8 word bytes, and possibly one pass-through count
+        buf: [u8; 10],
 
-    // 10 = tag byte, up to 8 word bytes, and possibly one pass-through count
-    buf: [u8; 10],
+        buf_pos: usize,
 
-    buf_pos: usize,
+        // number of bytes that we actually want to read into the buffer
+        buf_size: usize,
 
-    // number of bytes that we actually want to read into the buffer
-    buf_size: usize,
-
-    num_run_bytes_remaining: usize,
+        num_run_bytes_remaining: usize,
+    }
 }
 
-impl<R> PackedRead<R>
-where
-    R: AsyncRead + Unpin,
-{
+impl<R: AsyncRead> PackedRead<R> {
     /// Creates a new `PackedRead` from a `AsyncRead`. For optimal performance,
     /// `inner` should be a buffered `AsyncRead`.
     pub fn new(inner: R) -> Self {
@@ -76,28 +74,22 @@ where
     }
 }
 
-impl<R> AsyncRead for PackedRead<R>
-where
-    R: AsyncRead + Unpin,
-{
+impl<R: AsyncRead> AsyncRead for PackedRead<R> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         outbuf: &mut [u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        let Self {
-            stage,
-            inner,
-            buf,
-            buf_pos,
-            num_run_bytes_remaining,
-            buf_size,
-            ..
-        } = &mut *self;
+        let mut this = self.project();
+        let stage = this.stage;
+        let buf = this.buf;
+        let buf_pos = this.buf_pos;
+        let num_run_bytes_remaining = this.num_run_bytes_remaining;
+        let buf_size = this.buf_size;
         loop {
             match *stage {
                 PackedReadStage::Start => {
-                    match Pin::new(&mut *inner).poll_read(cx, &mut buf[*buf_pos..2])? {
+                    match this.inner.as_mut().poll_read(cx, &mut buf[*buf_pos..2])? {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(n) => {
                             if n == 0 {
@@ -143,7 +135,7 @@ where
                     return Poll::Ready(Ok(num_zeroes));
                 }
                 PackedReadStage::BufferingWord => {
-                    match Pin::new(&mut *inner).poll_read(cx, &mut buf[*buf_pos..*buf_size])? {
+                    match this.inner.as_mut().poll_read(cx, &mut buf[*buf_pos..*buf_size])? {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(0) => {
                             return Poll::Ready(Err(std::io::Error::from(
@@ -190,7 +182,7 @@ where
                     if upper_bound == 0 {
                         *stage = PackedReadStage::Start;
                     } else {
-                        match Pin::new(&mut *inner).poll_read(cx, &mut outbuf[0..upper_bound])? {
+                        match this.inner.as_mut().poll_read(cx, &mut outbuf[0..upper_bound])? {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(n) => {
                                 if n == 0 {
@@ -214,14 +206,13 @@ where
 /// has zero bytes left (i.e. is at end-of-file). To read a stream
 /// containing an unknown number of messages, you could call this function
 /// repeatedly until it returns `None`.
-pub async fn try_read_message<R>(
+pub async fn try_read_message<R: AsyncRead>(
     read: R,
     options: message::ReaderOptions,
 ) -> Result<Option<message::Reader<OwnedSegments>>>
-where
-    R: AsyncRead + Unpin,
 {
     let packed_read = PackedRead::new(read);
+    pin_mut!(packed_read);
     crate::serialize::try_read_message(packed_read, options).await
 }
 

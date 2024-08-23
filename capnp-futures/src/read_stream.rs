@@ -18,68 +18,47 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+use capnp::serialize::OwnedSegments;
 use futures::future::Future;
 use futures::stream::Stream;
-use futures::AsyncRead;
+use futures::{pin_mut, AsyncRead};
+use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use capnp::{message, Error};
 
-async fn read_next_message<R>(
-    mut reader: R,
-    options: message::ReaderOptions,
-) -> Result<(R, Option<message::Reader<capnp::serialize::OwnedSegments>>), Error>
-where
-    R: AsyncRead + Unpin,
-{
-    let m = crate::serialize::try_read_message(&mut reader, options).await?;
-    Ok((reader, m))
-}
-
-type ReadStreamResult<R> =
-    Result<(R, Option<message::Reader<capnp::serialize::OwnedSegments>>), Error>;
-
-/// An incoming sequence of messages.
-#[must_use = "streams do nothing unless polled"]
-pub struct ReadStream<'a, R>
-where
-    R: AsyncRead + Unpin,
-{
-    options: message::ReaderOptions,
-    read: Pin<Box<dyn Future<Output = ReadStreamResult<R>> + 'a>>,
-}
-
-impl<'a, R> Unpin for ReadStream<'a, R> where R: AsyncRead + Unpin {}
-
-impl<'a, R> ReadStream<'a, R>
-where
-    R: AsyncRead + Unpin + 'a,
-{
-    pub fn new(reader: R, options: message::ReaderOptions) -> Self {
-        ReadStream {
-            read: Box::pin(read_next_message(reader, options)),
-            options,
-        }
+pin_project! {
+    /// An incoming sequence of messages.
+    #[must_use = "streams do nothing unless polled"]
+    pub struct ReadStream<R: AsyncRead>
+    {
+        options: message::ReaderOptions,
+        #[pin]
+        reader: R,
     }
 }
 
-impl<'a, R> Stream for ReadStream<'a, R>
-where
-    R: AsyncRead + Unpin + 'a,
-{
-    type Item = Result<message::Reader<capnp::serialize::OwnedSegments>, Error>;
+impl<R: AsyncRead> ReadStream<R> {
+    pub fn new(reader: R, options: message::ReaderOptions) -> Self {
+        ReadStream { reader, options }
+    }
+}
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let (r, m) = match Future::poll(self.read.as_mut(), cx) {
+impl<R: AsyncRead> Stream for ReadStream<R> {
+    type Item = Result<message::Reader<OwnedSegments>, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        let next_message_fut =
+            crate::serialize::try_read_message(this.reader, this.options.clone());
+
+        pin_mut!(next_message_fut);
+        match Future::poll(next_message_fut, cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-            Poll::Ready(Ok(x)) => x,
-        };
-        self.read = Box::pin(read_next_message(r, self.options));
-        match m {
-            Some(message) => Poll::Ready(Some(Ok(message))),
-            None => Poll::Ready(None),
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Ok(Some(message))) => Poll::Ready(Some(Ok(message))),
         }
     }
 }
